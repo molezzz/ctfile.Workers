@@ -101,20 +101,19 @@ async function fileToLink(fileid, password, origin) {
         throw new Error("getfile.php 返回的数据缺少 userid/file_id/file_chk");
     }
 
-    const url = new URL(`${API_ORIGIN}/get_file_url.php`);
+    // 当前城通公开分享接口使用 get_down_url.php；旧的 get_file_url.php
+    // 仍可能返回 HTTP 200，但正文为空，不能再对它做 JSON.parse。
+    const url = new URL(`${API_ORIGIN}/get_down_url.php`);
     url.search = new URLSearchParams({
         uid: String(file.userid),
         fid: String(file.file_id),
-        folder_id: "0",
         file_chk: String(file.file_chk),
-        mb: "0",
-        app: "0",
-        acheck: "2",
-        verifycode: "",
+        start_time: String(file.start_time || Math.floor(Date.now() / 1000)),
+        wait_seconds: String(file.wait_seconds || 0),
         rd: String(Math.random()),
     });
     const response2 = await fetch(url, { headers });
-    const linkInfo = await readJson(response2, "get_file_url.php");
+    const linkInfo = await readJson(response2, "get_down_url.php");
     if (Number(linkInfo.code) === 200 && linkInfo.downurl) {
         return linkInfo.downurl;
     }
