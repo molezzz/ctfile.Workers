@@ -1,65 +1,125 @@
+// 不在公开仓库中保存城通密码；需要时通过请求的 pass 参数传入。
+const DEFAULT_PASSWORD = "";
+const API_ORIGIN = "https://webapi.ctfile.com";
+
 addEventListener("fetch", (event) => {
     event.respondWith(
-        handleRequest(event.request).catch(
-            (err) => new Response(err.stack, { status: 500 })
-        )
+        handleRequest(event.request).catch((err) => {
+            console.error("ctfile.Workers error:", err);
+            return new Response(`解析失败：${err.message || "未知错误"}`, {
+                status: 502,
+                headers: { "content-type": "text/plain; charset=utf-8" },
+            });
+        })
     );
 });
-password=547873715
+
 async function handleRequest(request) {
-    let url = new URL(request.url);
-    const { pathname } = new URL(request.url);
-    if(url.searchParams.get("pass")){
-        password=url.searchParams.get("pass")
+    const url = new URL(request.url);
+    const { pathname } = url;
+    const fileid = url.searchParams.get("file");
+    const password = url.searchParams.get("pass") || DEFAULT_PASSWORD;
+    const origin = url.origin;
+    if (!password) {
+        return new Response("缺少 pass 参数，或尚未配置默认密码", { status: 400 });
     }
+
+    if (!["/directlink", "/proxylink", "/getlink"].some((path) => pathname.startsWith(path))) {
+        return new Response("不支持的URL请求", { status: 404 });
+    }
+    if (!fileid) {
+        return new Response("缺少 file 参数", { status: 400 });
+    }
+
+    const link = await fileToLink(fileid, password, origin);
+    if (!link) {
+        return new Response("没有获取到下载地址", { status: 404 });
+    }
+
     if (pathname.startsWith("/directlink")) {
-        var fileid = url.searchParams.get("file");
-        var link = await fileToLink(fileid);
-        if (link) {
-            return Response.redirect(link, 302)
-        } else {
-            return new Response('文件不存在', { status: 404 })
-        }
+        return Response.redirect(link, 302);
     }
     if (pathname.startsWith("/proxylink")) {
-        var fileid = url.searchParams.get("file");
-        var link = await fileToLink(fileid);
-        if (link) {
-            return fetch(link)
-        } else {
-            return new Response('文件不存在', { status: 404 })
-        }
+        return fetch(link);
     }
-    if (pathname.startsWith("/getlink")) {
-        var fileid = url.searchParams.get("file");
-        var link = await fileToLink(fileid);
-        if (link) {
-            return new Response(link, { status: 200 })
-        } else {
-            return new Response('文件不存在', { status: 404 })
-        }
-    }
-    return new Response('不支持的URL请求', { status: 404 })
+    return new Response(link, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+    });
 }
 
-async function fileToLink(fileid) {
-    jsonurl = "https://webapi.ctfile.com/getfile.php?path=f&f=" + fileid + "&passcode="+password+"&token=false&r=" + Math.random() + "&ref=https://ctfile.qinlili.workers.dev"
-    const response = await fetch(jsonurl, {
-        "headers": {
-            "origin": "https://ctfile.qinlili.workers.dev",
-            "referer": "https://ctfile.qinlili.workers.dev"
-        },
+async function readJson(response, name) {
+    const text = await response.text();
+    if (!text.trim()) {
+        throw new Error(`${name}返回空响应（HTTP ${response.status}）`);
+    }
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        throw new Error(`${name}返回的不是有效JSON（HTTP ${response.status}）`);
+    }
+}
+
+async function fileToLink(fileid, password, origin) {
+    if (!/^[A-Za-z0-9_-]+$/.test(fileid)) {
+        throw new Error("file 参数格式不正确");
+    }
+
+    // 两段 ID 使用 file，三段及以上使用 f；与 ctfileGet 的实现保持一致。
+    const path = fileid.split("-").length === 2 ? "file" : "f";
+    const query = new URLSearchParams({
+        path,
+        f: fileid,
+        passcode: password,
+        token: "false",
+        r: String(Math.random()),
+        ref: origin,
     });
-    jsonFile = await response.text()
-    jsonText = JSON.parse(jsonFile);
-    jsonurl2 = "https://webapi.ctfile.com/get_file_url.php?uid=" + jsonText.userid + "&fid=" + jsonText.file_id + "&file_chk=" + jsonText.file_chk + "&app=0&acheck=2&rd=" + Math.random()
-    const response2 = await fetch(jsonurl2, {
-        "headers": {
-            "origin": "https://ctfile.qinlili.workers.dev",
-            "referer": "https://ctfile.qinlili.workers.dev"
-        },
+    const headers = {
+        "origin": origin,
+        "referer": `${origin}/`,
+        "accept": "application/json, text/plain, */*",
+    };
+
+    const response = await fetch(`${API_ORIGIN}/getfile.php?${query}`, { headers });
+    const fileInfo = await readJson(response, "getfile.php");
+    if (Number(fileInfo.code) !== 200 || !fileInfo.file) {
+        throw new Error(fileInfo.file?.message || fileInfo.message || "文件不存在或密码错误");
+    }
+
+    const file = fileInfo.file;
+    if (Number(file.is_vip) === 1) {
+        // VIP 文件的下载地址由 getfile.php 直接返回。
+        const vipLink = file.vip_dx_url || file.vip_yd_url || file.vip_lt_url || file.us_downurl_a;
+        if (!vipLink) {
+            throw new Error("VIP 文件没有可用的下载地址");
+        }
+        return vipLink;
+    }
+
+    if (!file.userid || !file.file_id || !file.file_chk) {
+        throw new Error("getfile.php 返回的数据缺少 userid/file_id/file_chk");
+    }
+
+    const url = new URL(`${API_ORIGIN}/get_file_url.php`);
+    url.search = new URLSearchParams({
+        uid: String(file.userid),
+        fid: String(file.file_id),
+        folder_id: "0",
+        file_chk: String(file.file_chk),
+        mb: "0",
+        app: "0",
+        acheck: "2",
+        verifycode: "",
+        rd: String(Math.random()),
     });
-    jsonFile2 = await response2.text()
-    jsonText2 = JSON.parse(jsonFile2);
-    return jsonText2.downurl;
+    const response2 = await fetch(url, { headers });
+    const linkInfo = await readJson(response2, "get_file_url.php");
+    if (Number(linkInfo.code) === 200 && linkInfo.downurl) {
+        return linkInfo.downurl;
+    }
+    if (Number(linkInfo.code) === 302) {
+        throw new Error("该文件需要登录城通账号");
+    }
+    throw new Error(linkInfo.message || "获取下载地址失败");
 }
